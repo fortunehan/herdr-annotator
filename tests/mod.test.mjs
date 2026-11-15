@@ -4,6 +4,7 @@ import vm from "node:vm";
 import { readFileSync } from "node:fs";
 import * as review from "../mods/annotator/review.js";
 import * as syntax from "../mods/annotator/syntax.js";
+import * as aiReview from "../mods/annotator/ai-review.js";
 import { DraftLifecycle } from "../mods/annotator/draft.js";
 import { GithubRefresh } from "../mods/annotator/github-refresh.js";
 import { UpdateController } from "../mods/annotator/updates.js";
@@ -23,6 +24,7 @@ function harness() {
         else if (key === "opacity") data.opacity = args[0];
         else if (key === "transition") data.transition = args;
         else if (key === "h") data.height = args[0];
+        else if (key === "tooltip") data.tooltip = args[0];
         else if (key === "child") data.children.push(args[0]);
         else if (key === "children") data.children.push(...args[0]);
         else if (key === "when" && args[0]) args[1](proxy);
@@ -57,7 +59,7 @@ function harness() {
   } }, spawn(fn) { jobs.push(Promise.resolve().then(() => fn(cx))); } };
   const storage = new Map();
   const context = {
-    ...review, ...syntax, DraftLifecycle, GithubRefresh, UpdateController,
+    ...review, ...syntax, ...aiReview, DraftLifecycle, GithubRefresh, UpdateController,
     sessionStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
     View: class {}, div: node, h_flex: node, v_flex: node, v_resizable: node, h_resizable: node,
     resizable_panel: () => { state.panelCalls = (state.panelCalls ?? 0) + 1; return node(); },
@@ -89,6 +91,7 @@ function harness() {
     props: () => ({ scope: state.scope, space: "space1", tab: state.tab, ...state.props }),
     theme: () => ({ dim: "#666666", ansi1: "#ff0000", ansi2: "#00ff00" }), settings: () => ({}),
     agents: () => state.agents, focused: () => state.focus,
+    liveTerminals: () => state.terminals ?? state.agents.map((agent, index) => ({ address: agent.address, foreground: { pid: 4000 + index } })),
     spaces: () => [{ id: "space1", tabs: [{ id: state.tab }, ...(state.reviewTabs ?? [])] }],
     panes: () => state.reviewPanes ?? [],
     home: () => "/home/me", exec: async (_helper, args) => {
@@ -1925,4 +1928,169 @@ test("keyboard review delivery accepts working but not blocked or unreported sou
     h.mod.reviewNote.editor.emit("submit", { secondary: true }); await h.drain();
     assert.equal(h.requests.some(request => request.op === "send"), status === "working", String(status));
   }
+});
+
+const HEAD = "c".repeat(40);
+function aiHarness(options = {}) {
+  const h = harness();
+  h.state.props = options.props ?? {};
+  h.state.shared[aiReview.REVIEW_BRIDGE] = options.bridge === null ? null
+    : { version: 1, instance: "inst-9", expires: Date.now() + 60000, command: "tabs-tasks.review-open:", results: "changes.review.launch-results" };
+  h.state.reply = request => {
+    const data = h.snapshot();
+    const base = request.scope?.comparison?.mode === "branch" ? request.scope.comparison.base ?? "origin/develop" : null;
+    data.snapshot.scope = { ...request.scope, ...(base ? { comparison: { mode: "branch", base } } : { comparison: undefined }) };
+    data.snapshot.head = HEAD; data.snapshot.baseline = HEAD;
+    return { code: 0, stdout: JSON.stringify({ ok: true, data }) };
+  };
+  return h;
+}
+const aiRequests = h => h.state.commands.filter(command => typeof command.name === "string" && command.name.startsWith("tabs-tasks.review-open:"));
+const aiPayload = command => JSON.parse(decodeURIComponent(command.name.slice("tabs-tasks.review-open:".length)));
+const aiTexts = h => h.nodes.flatMap(node => node.children).filter(child => typeof child === "string");
+const aiNode = (h, id) => { h.nodes.length = 0; h.mod.render(h.cx); return h.nodes.findLast(node => node.id === id); };
+
+test("AI Review appears only in the sidebar, beside the untouched Open review", async () => {
+  const sidebar = aiHarness(); sidebar.mod.init({}, sidebar.cx); await sidebar.drain();
+  const button = aiNode(sidebar, "ai-review");
+  assert.ok(button); assert.ok(button.children.includes("AI Review"));
+  assert.match(button.tooltip, /Nothing runs until you press Run/);
+  const open = aiNode(sidebar, "open-full-review");
+  assert.ok(open); assert.equal(open.tooltip, "Open full review tab");
+  assert.equal(typeof open.events.on_click, "function");
+  const rendered = sidebar.nodes;
+  assert.equal(rendered.indexOf(rendered.find(node => node.id === "ai-review")), rendered.indexOf(rendered.find(node => node.id === "open-full-review")) + 1, "built directly after Open review in the same header");
+  assert.equal(rendered[rendered.findIndex(node => node.id === "ai-review") + 1].id, "review-updates");
+  const full = aiHarness({ props: { presentation: "full" } }); full.mod.init({}, full.cx); await full.drain();
+  full.nodes.length = 0; full.mod.render(full.cx);
+  assert.equal(full.nodes.some(node => node.id === "ai-review" || node.id === "ai-review-message"), false);
+  assert.equal(full.nodes.some(node => node.id === "full-review-options"), true);
+});
+
+test("clicking Open review still creates the manual full tab and never touches the bridge", async () => {
+  const h = aiHarness(); h.mod.init({}, h.cx); await h.drain();
+  aiNode(h, "open-full-review").events.on_click({}, h.cx); await h.drain();
+  assert.equal(h.state.commands.some(command => command.name === "tab.new"), true);
+  assert.equal(aiRequests(h).length, 0);
+  assert.equal(h.mod.aiReview.pending, null);
+});
+
+test("AI Review submits the loaded Uncommitted target and source without running anything", async () => {
+  const h = aiHarness(); h.mod.init({}, h.cx); await h.drain();
+  aiNode(h, "ai-review").events.on_click({}, h.cx);
+  const [command] = aiRequests(h);
+  assert.equal(aiRequests(h).length, 1);
+  const request = aiPayload(command);
+  assert.equal(request.bridge, "inst-9");
+  assert.deepEqual(request.target, { cwd: "/checkout", on: null, workspace: "space1", tab: "tab1",
+    comparison: { mode: "uncommitted", base: null }, head: HEAD, baseline: HEAD, source: { address: "t7", pid: 4000 } });
+  assert.equal(h.state.commands.every(entry => !/^(?:review-|tabs-tasks\.review-(?!open:))/.test(entry.name ?? "")), true);
+  assert.equal(h.requests.some(entry => entry.op === "send"), false);
+});
+
+test("AI Review keeps the actual Branch ref, including an automatic one, and the focused source", async () => {
+  const h = aiHarness();
+  h.state.agents.push({ address: "t8", pane: "p8", space: "space1", tab: "tab1", status: "idle" });
+  h.state.focus = { terminal: "t8", pane: "p8" };
+  h.mod.init({}, h.cx); await h.drain();
+  h.mod.changeComparison("branch", null, h.cx, false); await h.drain();
+  assert.equal(h.mod.base, "origin/develop");
+  aiNode(h, "ai-review").events.on_click({}, h.cx);
+  const target = aiPayload(aiRequests(h)[0]).target;
+  assert.deepEqual(target.comparison, { mode: "branch", base: "origin/develop" });
+  assert.deepEqual(target.source, { address: "t8", pid: 4001 });
+  h.state.focus = { terminal: "t7", pane: "p7" };
+  assert.equal(aiPayload(aiRequests(h)[0]).target.source.address, "t8", "captured before focus changed");
+});
+
+test("explicit Branch ref is sent as chosen", async () => {
+  const h = aiHarness(); h.mod.init({}, h.cx); await h.drain();
+  h.mod.changeComparison("branch", "release/9", h.cx, true); await h.drain();
+  aiNode(h, "ai-review").events.on_click({}, h.cx);
+  assert.deepEqual(aiPayload(aiRequests(h)[0]).target.comparison, { mode: "branch", base: "release/9" });
+});
+
+test("AI Review does not guess a source between several chats", async () => {
+  const h = aiHarness();
+  h.state.agents.push({ address: "t8", pane: "p8", space: "space1", tab: "tab1", status: "idle" });
+  h.state.focus = { terminal: "elsewhere", pane: "other" };
+  h.mod.init({}, h.cx); await h.drain();
+  aiNode(h, "ai-review").events.on_click({}, h.cx);
+  assert.equal(aiRequests(h).length, 0);
+  h.nodes.length = 0; h.mod.render(h.cx);
+  assert.match(aiTexts(h).join("\n"), /Focus the agent chat/);
+});
+
+test("last commit comparison is refused visibly", async () => {
+  const h = aiHarness(); h.mod.init({}, h.cx); await h.drain();
+  h.mod.changeComparison("last_commit", null, h.cx); await h.drain();
+  h.state.reply = request => { const data = h.snapshot(); data.snapshot.scope = request.scope; data.snapshot.head = HEAD; data.snapshot.baseline = HEAD; return { code: 0, stdout: JSON.stringify({ ok: true, data }) }; };
+  h.mod.refresh(h.cx, true); await h.drain();
+  aiNode(h, "ai-review").events.on_click({}, h.cx);
+  assert.equal(aiRequests(h).length, 0);
+  h.nodes.length = 0; h.mod.render(h.cx);
+  assert.match(aiTexts(h).join("\n"), /Uncommitted and Branch/);
+});
+
+test("without Shepherdr the review still works and AI Review explains itself", async () => {
+  const h = aiHarness({ bridge: null }); h.mod.init({}, h.cx); await h.drain();
+  assert.match(aiNode(h, "ai-review").tooltip, /unavailable/);
+  aiNode(h, "ai-review").events.on_click({}, h.cx);
+  assert.equal(aiRequests(h).length, 0);
+  h.nodes.length = 0; h.mod.render(h.cx);
+  assert.ok(h.nodes.some(node => node.id === "ai-review-message"));
+  assert.match(aiTexts(h).join("\n"), /Update\/enable Shepherdr/);
+  assert.equal(typeof aiNode(h, "open-full-review").events.on_click, "function");
+  assert.equal(typeof aiNode(h, "ai-review").events.on_click, "function", "can be retried after Shepherdr is available");
+  assert.equal(h.mod.data.snapshot.files[0].path, "a.rs");
+});
+
+test("duplicate clicks submit once and the pending button is disabled until a result arrives", async () => {
+  const h = aiHarness(); h.mod.init({}, h.cx); await h.drain();
+  const first = aiNode(h, "ai-review");
+  first.events.on_click({}, h.cx); first.events.on_click({}, h.cx);
+  assert.equal(aiRequests(h).length, 1);
+  const pending = aiNode(h, "ai-review");
+  assert.ok(pending.children.includes("Opening…")); assert.equal(pending.events.on_click, undefined);
+  const id = aiPayload(aiRequests(h)[0]).id;
+  h.state.shared["changes.review.launch-results"] = [{ id, status: "opened", error: null, overlay: "o1", at: Date.now() }];
+  h.state.timers.at(-1).fire();
+  const done = aiNode(h, "ai-review");
+  assert.ok(done.children.includes("AI Review")); assert.equal(typeof done.events.on_click, "function");
+  assert.equal(h.nodes.some(node => node.id === "ai-review-message"), false);
+  done.events.on_click({}, h.cx);
+  assert.equal(aiRequests(h).length, 2); assert.notEqual(aiPayload(aiRequests(h)[1]).id, id);
+});
+
+test("Shepherdr error results are shown and can be dismissed; nothing is retried", async () => {
+  const h = aiHarness(); h.mod.init({}, h.cx); await h.drain();
+  aiNode(h, "ai-review").events.on_click({}, h.cx);
+  const id = aiPayload(aiRequests(h)[0]).id;
+  h.state.shared["changes.review.launch-results"] = [{ id, status: "error", error: "The review target changed; reopen AI Review", overlay: null, at: Date.now() }];
+  h.state.timers.at(-1).fire();
+  h.nodes.length = 0; h.mod.render(h.cx);
+  assert.ok(h.nodes.some(node => node.id === "ai-review-message"));
+  assert.ok(aiTexts(h).includes("The review target changed; reopen AI Review"));
+  assert.equal(aiRequests(h).length, 1);
+  h.nodes.find(node => node.id === "ai-review-dismiss").events.on_click({}, h.cx);
+  h.nodes.length = 0; h.mod.render(h.cx);
+  assert.equal(h.nodes.some(node => node.id === "ai-review-message"), false);
+});
+
+test("AI Review leaves drafts, comparison and navigation untouched", async () => {
+  const h = aiHarness(); h.mod.init({}, h.cx); await h.drain();
+  h.mod.editor.set_value("unsaved feedback");
+  const before = { open: h.mod.open, mode: h.mod.mode, view: h.mod.view, requests: h.requests.length, context: h.mod.context };
+  aiNode(h, "ai-review").events.on_click({}, h.cx);
+  assert.equal(h.mod.editor.value(), "unsaved feedback");
+  assert.deepEqual({ open: h.mod.open, mode: h.mod.mode, view: h.mod.view, requests: h.requests.length, context: h.mod.context }, before);
+  assert.equal(h.mod.busy, false);
+});
+
+test("a stale loaded context blocks AI Review instead of using the new focus", async () => {
+  const h = aiHarness(); h.mod.init({}, h.cx); await h.drain();
+  h.mod.context = "an older checkout";
+  h.mod.startAiReview(h.cx);
+  assert.equal(aiRequests(h).length, 0);
+  assert.match(h.mod.aiReview.message.text, /finish loading/);
 });
