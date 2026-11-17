@@ -20,7 +20,7 @@ class InstallerTest(unittest.TestCase):
             shutil.copy2(source / "scripts" / name, self.repo / "scripts" / name)
         mod = self.repo / "mods/annotator"
         mod.mkdir(parents=True)
-        for name in ["main.js", "review.js", "full.js", "syntax.js", "draft.js", "github-refresh.js", "updates.js", "launcher.js"]:
+        for name in ["main.js", "review.js", "full.js", "syntax.js", "draft.js", "github-refresh.js", "updates.js", "ai-review.js", "launcher.js"]:
             (mod / name).write_text(f"// {name}\n")
         (mod / "mod.json").write_text(json.dumps({"version": "0.2.0"}))
         (self.repo / ".gitignore").write_text("target/\n__pycache__/\n")
@@ -71,6 +71,22 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(self.receipt()["layouts"], ["one", "two"])
         self.assertEqual(layouts, {path: path.read_bytes() for path in layouts})
         self.assertTrue(list((self.home / ".local/share/herdr-annotator/backups").glob("*/install.json")))
+
+    def test_ai_review_module_is_installed_and_locally_patched_mods_are_refused(self):
+        first = self.install()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        mod = self.app / "mods/annotator"
+        self.assertTrue((mod / "ai-review.js").is_file())
+        self.assertIn("ai-review.js", self.receipt()["files"])
+        (mod / "main.js").write_text("// a local patch\n")
+        (mod / "navigation.js").write_text("// a local file\n")
+        (self.repo / "mods/annotator/main.js").write_text("// changed source\n")
+        self.git("commit", "-qam", "source change")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Installed mod changed locally", result.stderr)
+        self.assertEqual((mod / "main.js").read_text(), "// a local patch\n")
+        self.assertEqual((mod / "navigation.js").read_text(), "// a local file\n")
 
     def test_modified_helper_and_updater_are_refused_before_replacing_mods(self):
         first = self.install()

@@ -64,6 +64,18 @@ Unsupported tabs versions and locally edited private copies are refused.
 This opt-in backs up the layout. Shipped layouts are refused. Herdr hot reloads
 mod/layout changes; no service restart. `HERDR_APP_HOME` selects another app home.
 
+Local patches to an installed copy: the installer compares every installed file
+with `install.json` and refuses to overwrite a modified one, so it will not run
+against an installation that carries local edits. To add a source change such as
+`ai-review.js` to such an installation without losing those edits, do not force
+the installer. Instead back up `~/.config/herdr-app/mods/annotator`, copy the
+mod folder to a scratch directory, apply the source diff there
+(`git diff <old>..<new> -- mods/annotator/main.js | patch -F3 -p3 -d <scratch>`,
+then inspect the result), add the new files, run `herdr-app check <scratch>`,
+and only then copy the files into the mod folder. Herdr hot reloads it.
+Alternatively, port the local patches into this repository first, then run
+`python3 scripts/install.py`.
+
 Use **↗** in Changes to open a full review tab. This pins the source checkout/chat
 and handles sidebar visibility. A bare `tab.new --mod annotator` does not supply
 that source binding or enable the full presentation.
@@ -228,6 +240,34 @@ Old/new multiline state is separate and resets at hidden gaps. This is a small
 lexer, not a full language grammar. Unsupported languages and extreme lines
 stay plain. Large compact-sidebar previews also stay plain to keep rendering
 bounded; full review colors only the visible rows.
+
+### AI Review (Shepherdr)
+
+In the Changes sidebar only, **AI Review** sits beside the full-review control.
+It asks Shepherdr to open its existing Changes Review dialog for the comparison
+you are looking at. It does **not** start a review: you still choose the model,
+effort and depth there and press **Run**. The full review tab has no AI Review
+button, and the full-review control keeps its manual annotation behavior.
+
+Annotator captures the target at the click, before focus can change: the loaded
+snapshot's checkout (including a followed task worktree), the actual
+Uncommitted or Branch comparison with its resolved ref, the snapshot's HEAD and
+baseline, the workspace and tab, and the focused agent chat that is this view's
+source session with its current process. Nothing falls back to another checkout,
+an inferred base or a different chat. The button waits for Shepherdr's reply
+and ignores further clicks meanwhile, so one click opens at most one dialog.
+
+It shows a message in the sidebar, and sends nothing, when Shepherdr is absent
+or outdated (the rest of Annotator is unaffected), the comparison is Last commit,
+the checkout is on a remote machine, no single source chat is focused, the
+changes are loading or stale, or Shepherdr refuses or does not confirm the
+request in 15 seconds. Dismiss the message and click again to retry.
+
+The protocol is Shepherdr's documented launch bridge v1 (`core/review-launch.md`
+in its repository). Annotator imports no code from another mod; `ai-review.js`
+only reads the `changes.review.bridge` shared value and issues the advertised
+command. Select a chat with one agent per tab, or focus the intended chat, so
+the source is unambiguous.
 
 ### Edit, delete, and quick questions
 
@@ -478,6 +518,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 npm test
 herdr-app check "$PWD/mods/annotator"
+python3 scripts/native_ai_review_check.py --spec
 python3 scripts/native_stress.py --files 5000
 python3 scripts/native_stress.py --full --files 5000 --rows 2000
 ```

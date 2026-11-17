@@ -8,6 +8,8 @@ import { DraftLifecycle } from "./draft.js";
 import { GithubRefresh } from "./github-refresh.js";
 import { reviewLocation } from "./review.js";
 import { UpdateController } from "./updates.js";
+import { AiReviewLauncher } from "./ai-review.js";
+import { terminals as liveTerminals } from "herdr";
 import { escapeText, copiedDiff, copiedSelection, contextGaps } from "./review.js";
 import { reviewOrderKey, orderedReviewFiles, existingReviewTab, deliveryBlocker, reviewTargetReady, reviewedDraft, agentWaiting, reviewTotals } from "./review.js";
 
@@ -49,6 +51,7 @@ export default class Annotator extends View {
     this.baseEditor.on("change", (_event, cx) => cx.notify());
     this.baseEditor.on("submit", (_event, cx) => this.applyBase(cx));
     this.githubRefresh = new GithubRefresh(); this.bases = [];
+    this.aiReview = new AiReviewLauncher({ shared, run });
     const sizes = shared("annotator.sections");
     this.sizes = Array.isArray(sizes) && sizes.length === 3 && sizes.every(n => Number.isFinite(n) && n > 0) ? sizes : [140, 360, 175];
     this.view = ["comments", "github"].includes(props()?.view) ? props().view : "diff"; this.filesOpen = this.full ? preferences.filesOpen : true;
@@ -132,7 +135,7 @@ export default class Annotator extends View {
     this.updates.publish(blocked);
   }
 
-  close() { this.closed = true; this.copyTimer?.cancel(); this.sidebarTimer?.cancel(); this.updates?.close(Boolean(this._busy || this.ordering)); }
+  close() { this.closed = true; this.copyTimer?.cancel(); this.sidebarTimer?.cancel(); this.aiReviewTimer?.cancel(); this.updates?.close(Boolean(this._busy || this.ordering)); }
 
   orderEntry(snapshot = this.data?.snapshot) {
     return (shared("annotator.fileOrders") ?? []).find(entry => entry.key === reviewOrderKey(snapshot));
@@ -731,7 +734,7 @@ export default class Annotator extends View {
       this.snapshotRequest = null; this.busy = false;
     }
     if (next !== this.context) {
-      this.reviewSend = null; this.reviewOptionsOpen = false; this.fileActionsOpen = false;
+      this.reviewSend = null; this.reviewOptionsOpen = false; this.fileActionsOpen = false; this.aiReview.dismiss();
       const draft = this.draft.enter(next, this.context, { open: this.open, mode: this.mode, base: this.base, baseExplicit: this.baseExplicit, contextLines: this.contextLines }, this.data?.snapshot.revision);
       this.context = next; this.data = null; this.open = draft?.open ?? props()?.file ?? null;
       const preferences = this.fullSettings(), scope = location().scope;
@@ -1029,6 +1032,45 @@ export default class Annotator extends View {
     });
   }
 
+  /**
+   * Sidebar only. Everything the bridge needs is captured here, synchronously,
+   * from this view's own target; focus can move afterwards without rebinding it.
+   */
+  startAiReview(cx) {
+    if (this.full) return;
+    const current = location(), source = this.currentSession();
+    const terminal = source ? liveTerminals().find(entry => entry.address === source.address) ?? null : null;
+    const submitted = this.aiReview.start({ current, snapshot: this.data?.snapshot ?? null, source, terminal,
+      view: { full: this.full, busy: this.busy, snapshotError: this.snapshotError, context: contextKey(),
+        loadedContext: this.context, mode: this.mode, base: this.base } });
+    if (submitted) this.watchAiReview(cx);
+    cx.notify();
+  }
+
+  watchAiReview(cx) {
+    this.aiReviewTimer?.cancel();
+    this.aiReviewTimer = cx.timer.after(400, cx => {
+      if (this.closed) return;
+      this.aiReview.poll();
+      if (this.aiReview.pending) this.watchAiReview(cx);
+      cx.notify();
+    });
+  }
+
+  aiReviewButton() {
+    const pending = Boolean(this.aiReview.pending), bridge = this.aiReview.bridge();
+    return this.button("ai-review", pending ? "Opening…" : "AI Review", cx => this.startAiReview(cx), Boolean(this.data) && !pending, "secondary")
+      .tooltip(bridge.ok ? "Configure an AI review of these changes. Nothing runs until you press Run in the dialog." : bridge.reason);
+  }
+
+  aiReviewNotice(t) {
+    const message = this.aiReview.message;
+    return h_flex().id("ai-review-message").mx(8).my(4).p(8).gap(6).items_center().rounded(6).bg(t.raised).text_size(11.5)
+      .text_color(message.tone === "error" ? t.ansi3 : t.muted)
+      .child(div().flex_1().min_w(0).child(message.text))
+      .when(!this.aiReview.pending, el => el.child(this.button("ai-review-dismiss", "Dismiss", cx => { this.aiReview.dismiss(); cx.notify(); })));
+  }
+
   queueSidebarSync(paths, cx) {
     const root = appHome().replace(/\\/g, "/").replace(/\/$/, "");
     const relevant = paths.some(path => {
@@ -1314,6 +1356,7 @@ export default class Annotator extends View {
     this.publishUpdateState();
     if (this.updates?.running) return this.updateScreen();
     this.syncSidebar();
+    this.aiReview.poll();
     if (contextKey() !== this.context && (!this.busy || this.snapshotRequest)) this.refresh(cx);
     this.consumeOpenRequest(cx);
     if (contextKey() === this.context && this.machineUnavailable(location().scope) && !this.snapshotError) {
@@ -1358,11 +1401,13 @@ export default class Annotator extends View {
           .child(div().font_semibold().text_size(14).child("Changes"))
           .child(this.selectableText("review-branch-name", `${data?.snapshot.scope.machine ? data.snapshot.scope.machine + " · " : ""}${data?.snapshot.branch ?? ""}`).flex_1().min_w(0).truncate().text_size(11).text_color(t.dim))
           .child(this.button("open-full-review", "↗", cx => this.openFull(cx), Boolean(data)).tooltip("Open full review tab"))
+          .child(this.aiReviewButton())
           .child(this.button("review-updates", "↑", cx => { this.updates.save({ open: !this.updates.state.open }); this.updates.check(cx); cx.notify(); }).tooltip("Annotator updates"))
           .child(this.button("review-refresh", this.busy ? "…" : "↻", cx => { this.refresh(cx, true); this.refreshGithub(cx, true); }).tooltip("Refresh diff and GitHub"))))
       .child(this.updatePanel())
       .when(Boolean(this.error), el => el.child(this.errorCard(t)))
       .when(Boolean(this.notice), el => el.child(div().mx(8).my(4).p(8).rounded(6).bg(t.raised).text_size(11.5).text_color(t.muted).child(this.notice)))
+      .when(Boolean(this.aiReview.message), el => el.child(this.aiReviewNotice(t)))
       .child(h_flex().h(33).flex_none().px(6).gap(4).bg(t.chrome).border_b(1).border_color(t.border)
         .child(this.button("view-diff", "Code", cx => { this.view = "diff"; cx.notify(); }, true, this.view === "diff" ? "secondary" : "quiet"))
          .child(this.button("view-comments", `Comments · ${summary.total}`, cx => { this.view = "comments"; cx.notify(); }, true, this.view === "comments" ? "secondary" : "quiet"))
