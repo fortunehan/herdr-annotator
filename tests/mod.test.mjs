@@ -8,6 +8,9 @@ import * as aiReview from "../mods/annotator/ai-review.js";
 import { DraftLifecycle } from "../mods/annotator/draft.js";
 import { GithubRefresh } from "../mods/annotator/github-refresh.js";
 import { UpdateController } from "../mods/annotator/updates.js";
+import { mergeChatAgents } from "../mods/annotator/chat-agents.js";
+import * as navigation from "../mods/annotator/navigation.js";
+import * as follow from "../mods/annotator/follow.js";
 
 function harness() {
   const nodes = [], requests = [], jobs = [];
@@ -59,7 +62,7 @@ function harness() {
   } }, spawn(fn) { jobs.push(Promise.resolve().then(() => fn(cx))); } };
   const storage = new Map();
   const context = {
-    ...review, ...syntax, ...aiReview, DraftLifecycle, GithubRefresh, UpdateController,
+    ...review, ...syntax, ...aiReview, ...navigation, ...follow, DraftLifecycle, GithubRefresh, UpdateController,
     sessionStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
     View: class {}, div: node, h_flex: node, v_flex: node, v_resizable: node, h_resizable: node,
     resizable_panel: () => { state.panelCalls = (state.panelCalls ?? 0) + 1; return node(); },
@@ -90,8 +93,9 @@ function harness() {
     TextView: { html: (id, html) => { state.textViews ??= []; state.textViews.push({ id, html }); return node().id(id); } },
     props: () => ({ scope: state.scope, space: "space1", tab: state.tab, ...state.props }),
     theme: () => ({ dim: "#666666", ansi1: "#ff0000", ansi2: "#00ff00" }), settings: () => ({}),
-    agents: () => state.agents, focused: () => state.focus,
+    nativeAgents: () => state.agents, focused: () => state.focus, mergeChatAgents,
     liveTerminals: () => state.terminals ?? state.agents.map((agent, index) => ({ address: agent.address, foreground: { pid: 4000 + index } })),
+    terminals: () => state.terminals ?? state.agents.map((agent, index) => ({ address: agent.address, foreground: { pid: 4000 + index } })),
     spaces: () => [{ id: "space1", tabs: [{ id: state.tab }, ...(state.reviewTabs ?? [])] }],
     panes: () => state.reviewPanes ?? [],
     home: () => "/home/me", exec: async (_helper, args) => {
@@ -1565,7 +1569,7 @@ test("confirmed Send focuses only the exact recipient; failed Send never changes
   const h = harness(); h.mod.init({}, h.cx); await h.drain();
   h.mod.sendToSession(h.cx); await h.drain();
   assert.equal(h.state.commands.at(-1)?.name, "pane.focus");
-  assert.equal(h.state.commands.at(-1)?.args.terminal, "t7");
+  assert.equal(h.state.commands.at(-1)?.args.pane, "p7");
   h.state.commands = [];
   h.state.reply = async () => ({ code: 1, stdout: JSON.stringify({ ok: false, error: "Delivery not confirmed" }) });
   h.mod.sendToSession(h.cx); await h.drain();
@@ -2093,4 +2097,94 @@ test("a stale loaded context blocks AI Review instead of using the new focus", a
   h.mod.startAiReview(h.cx);
   assert.equal(aiRequests(h).length, 0);
   assert.match(h.mod.aiReview.message.text, /finish loading/);
+});
+
+function followHarness() {
+  const h = harness();
+  h.state.props = { scope: null };
+  h.state.focus = { space: "space1", tab: "tab1", pane: "p7", terminal: "t7" };
+  h.state.agents = [{ address: "t7", pane: "p7", space: "space1", tab: "tab1", status: "idle", cwd: "/space-checkout" },
+    { address: "t9", pane: "p9", space: "space1", tab: "chat-tab", status: "done", cwd: "/worktrees/snuw-9" }];
+  const tasks = active => ({ children: [{ id: "panel-body", active: "changes", children: [{ id: "tasks", active }, { id: "changes" }] }] });
+  const openTask = (where = { terminal: "t9", ref: "SNUW-9", folder: "/worktrees/snuw-9", machine: null, base: "main", branch: "feature/9", repo: "/space-checkout" }) => {
+    h.state.layout = tasks("tasks-thread");
+    h.state.shared["tasks.thread"] = { terminal: "t9", task: "SNUW-9", key: { folder: "/space-checkout", machine: null } };
+    if (where) h.state.shared["tasks.thread.where"] = where; else delete h.state.shared["tasks.thread.where"];
+  };
+  const backToList = () => { h.state.layout = tasks("tasks-list"); };
+  const snapshots = () => h.requests.filter(request => request.op === "snapshot");
+  const texts = () => { h.nodes.length = 0; h.mod.render(h.cx); return h.nodes.flatMap(node => node.children.filter(c => typeof c === "string")); };
+  return { ...h, openTask, backToList, snapshots, texts };
+}
+
+test("follow: without Shepherdr keys Changes reviews the focused space exactly as before", async () => {
+  const h = followHarness(); h.mod.init({}, h.cx); await h.drain();
+  assert.deepEqual(h.snapshots().map(r => [r.scope.repo, r.scope.comparison.mode]), [["/space-checkout", "uncommitted"]]);
+  assert.equal(h.mod.currentSession().address, "t7");
+});
+
+test("follow: a task open reviews its worktree against its base and sends to its agent", async () => {
+  const h = followHarness(); h.openTask(); h.mod.init({}, h.cx); await h.drain();
+  const [request] = h.snapshots();
+  assert.equal(request.scope.repo, "/worktrees/snuw-9");
+  assert.deepEqual(request.scope.comparison, { mode: "branch", base: "main" });
+  assert.equal(h.mod.baseExplicit, true);
+  assert.equal(h.mod.baseLabel(), "main");
+  assert.equal(h.mod.currentSession().address, "t9");
+  h.texts(); assert.match(h.state.textViews.findLast(view => view.id === "review-branch-name").html, /^SNUW-9 · /, "the header names the task");
+});
+
+test("follow: back on the list shows the space again with the person's own last mode", async () => {
+  const h = followHarness(); h.mod.init({}, h.cx); await h.drain();
+  h.mod.changeComparison("last_commit", null, h.cx); await h.drain();
+  h.openTask(); h.mod.render(h.cx); await h.drain();
+  assert.deepEqual(h.snapshots().at(-1).scope.comparison, { mode: "branch", base: "main" });
+  h.backToList(); h.mod.render(h.cx); await h.drain();
+  const last = h.snapshots().at(-1);
+  assert.equal(last.scope.repo, "/space-checkout");
+  assert.equal(last.scope.comparison.mode, "last_commit");
+  h.mod.changeComparison("uncommitted", null, h.cx); await h.drain();
+  h.openTask(); h.mod.render(h.cx); await h.drain();
+  assert.deepEqual(h.snapshots().at(-1).scope.comparison, { mode: "branch", base: "main" }, "the task keeps its own mode");
+});
+
+test("follow: until the task's place is published nothing of the space shows", async () => {
+  const h = followHarness(); h.openTask(null); h.mod.init({}, h.cx); await h.drain();
+  assert.equal(h.snapshots().length, 0);
+  assert.ok(h.texts().includes("Loading SNUW-9's changes…"));
+  h.openTask(); h.mod.render(h.cx); await h.drain();
+  assert.equal(h.snapshots().at(-1).scope.repo, "/worktrees/snuw-9");
+});
+
+test("follow: a gone worktree shows a quiet line, not an error or the space's files", async () => {
+  const h = followHarness(); h.openTask();
+  h.state.reply = () => ({ code: 1, stdout: JSON.stringify({ ok: false, error: "fatal: not a git repository (or any of the parent directories): .git" }) });
+  h.mod.init({}, h.cx); await h.drain();
+  const texts = h.texts();
+  assert.ok(texts.includes("SNUW-9's worktree is gone"), texts.join(" | "));
+  assert.equal(h.mod.error, null);
+  assert.ok(h.snapshots().every(request => request.scope.repo === "/worktrees/snuw-9"));
+});
+
+test("follow: a base only origin has is retried as origin's once", async () => {
+  const h = followHarness(); h.openTask();
+  h.state.reply = request => request.scope.comparison.base === "main"
+    ? { code: 1, stdout: JSON.stringify({ ok: false, error: "Base 'main' is not available locally; choose a local ref (no automatic fetch)" }) }
+    : { code: 0, stdout: JSON.stringify({ ok: true, data: h.snapshot() }) };
+  h.mod.init({}, h.cx); await h.drain();
+  assert.deepEqual(h.snapshots().map(r => r.scope.comparison.base), ["main", "origin/main"]);
+  assert.equal(h.mod.snapshotError, null);
+});
+
+test("follow: switching tasks fast keeps only the task open now", async () => {
+  const h = followHarness(); h.mod.init({}, h.cx);
+  h.openTask(); h.mod.render(h.cx);
+  h.state.shared["tasks.thread"] = { terminal: "t10", task: "SNUW-10" };
+  h.state.shared["tasks.thread.where"] = { terminal: "t10", ref: "SNUW-10", folder: "/worktrees/snuw-10", base: "develop" };
+  h.mod.render(h.cx); await h.drain(); h.mod.render(h.cx); await h.drain();
+  const last = h.snapshots().at(-1);
+  assert.equal(last.scope.repo, "/worktrees/snuw-10");
+  assert.deepEqual(last.scope.comparison, { mode: "branch", base: "develop" });
+  assert.equal(JSON.parse(h.mod.context).scope.repo, "/worktrees/snuw-10");
+  assert.ok(h.mod.data, "the latest task's snapshot is shown");
 });

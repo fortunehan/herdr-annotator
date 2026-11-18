@@ -1,12 +1,16 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, v_resizable, resizable_panel, v_virtual_list, Scrollbar, TextareaState, Textarea, TextView, InputState, Input, Select, Popup } from "gpui-base";
-import { spaces, panes, focused, agents, exec, home, props, theme, settings, shared, setShared, run, layout, appHome, watchFolder, machines, nextCommand } from "herdr";
+import { spaces, panes, focused, agents as nativeAgents, terminals, exec, home, props, theme, settings, shared, setShared, run, layout, appHome, watchFolder, machines, nextCommand } from "herdr";
+import { mergeChatAgents } from "./chat-agents.js";
+
+const agents = () => mergeChatAgents(nativeAgents(), terminals(), panes(), spaces());
 import { selectionFor, selectionPayload, selected, inlineAt, pendingComments, sessionTarget, fileStats, pathParts, commentStatus, commentLocation, reviewSummary, sendHint, unreadItems, visibleComments, layoutSidebar, reviewSidebarTransition, fullPreferences, snapshotFailure, needsFreshSnapshot, savedBaseChoice } from "./review.js";
 import { renderFull } from "./full.js";
 import { highlightDiff } from "./syntax.js";
 import { DraftLifecycle } from "./draft.js";
 import { GithubRefresh } from "./github-refresh.js";
-import { reviewLocation } from "./review.js";
+import { navigationLocation, reviewFileRequest, requestForView } from "./navigation.js";
+import { followTask, taskOpen, goneLine, taskGone } from "./follow.js";
 import { UpdateController } from "./updates.js";
 import { AiReviewLauncher } from "./ai-review.js";
 import { terminals as liveTerminals } from "herdr";
@@ -15,7 +19,9 @@ import { reviewOrderKey, orderedReviewFiles, existingReviewTab, deliveryBlocker,
 
 function location() {
   const fixed = props();
-  return fixed?.scope ? reviewLocation(fixed) : reviewLocation(null, focused(), spaces(), panes(), agents());
+  const task = fixed?.scope ? null
+    : followTask({ open: taskOpen(layout()), thread: shared("tasks.thread"), where: shared("tasks.thread.where") });
+  return navigationLocation(fixed, focused(), spaces(), panes(), agents(), shared("annotator.fullTabs") ?? {}, task);
 }
 const contextKey = () => JSON.stringify(location());
 const focusOwner = () => { const f = focused(); return JSON.stringify([f?.space, f?.tab, f?.pane]); };
@@ -585,7 +591,9 @@ export default class Annotator extends View {
 
   consumeOpenRequest(cx) {
     const request = shared("annotator.open");
-    if (!request) return;
+    const reviewTab = request?.target_tab && this.full
+      ? existingReviewTab(location(), spaces(), panes(), shared("annotator.fullTabs") ?? {})?.tab : null;
+    if (!request || !requestForView(request, this.full, reviewTab)) return;
     const clear = () => { if (shared("annotator.open")?.id === request.id) setShared("annotator.open", null); };
     if (typeof request.id !== "string" || !request.id || !Number.isFinite(request.at)
       || Date.now() - request.at > 30000 || request.at > Date.now() + 5000 || typeof request.path !== "string"
@@ -593,6 +601,14 @@ export default class Annotator extends View {
     if (this.busy || this.snapshotError || !this.data) return;
     const scope = this.data.snapshot.scope, root = scope.repo.replace(/\/$/, "");
     if ((request.on ?? null) !== (scope.machine ?? null) || !request.path.startsWith(`${root}/`)) return;
+    if (request.comparison && this.openComparisonId !== request.id) {
+      this.openComparisonId = request.id;
+      const { mode, base, explicit } = request.comparison;
+      if (["uncommitted", "branch", "last_commit"].includes(mode)
+          && (this.mode !== mode || this.base !== base || this.baseExplicit !== explicit)) {
+        this.changeComparison(mode, base, cx, explicit); return;
+      }
+    }
     if (this.openRequestId !== request.id) { this.openRequestId = request.id; this.refresh(cx, true, true); return; }
     const path = request.path.slice(root.length + 1), file = this.data.snapshot.files.find(f => f.path === path);
     if (!file) { this.notice = "Requested file has no diff in this scope."; clear(); return; }
@@ -697,7 +713,8 @@ export default class Annotator extends View {
   }
 
   emptyCheckout(t) {
-    const scope = location().scope;
+    const { scope, task } = location();
+    if (task) return this.taskPlaceholder(t, task);
     return v_flex().id("review-empty-checkout").size_full().min_h(0).bg(t.background).text_color(t.foreground)
       .child(h_flex().h(40).px(12).gap(8).items_center().flex_none().bg(t.chrome)
         .child(div().font_semibold().text_size(14).child(this.full ? "Review" : "Changes"))
@@ -711,6 +728,19 @@ export default class Annotator extends View {
         .when(Boolean(scope.repo), el => el.child(div().w_full().truncate().text_size(11).text_color(t.dim)
           .child(`${scope.machine ? scope.machine + " · " : ""}${scope.repo}`)))
         .when(Boolean(this.editor.value().trim()), el => el.child(div().text_size(12).text_color(t.muted).child("Your unsaved draft is kept. Return to a Git checkout to continue."))));
+  }
+
+  /** A followed task with nothing to diff: its place not published yet, or its worktree gone. Quiet, not an error. */
+  taskPlaceholder(t, task) {
+    const line = task.pending ? `Loading ${task.ref ?? "the task"}'s changes…` : goneLine(task.ref, null);
+    return v_flex().id("review-task-placeholder").size_full().min_h(0).bg(t.background).text_color(t.foreground)
+      .child(h_flex().h(40).px(12).gap(8).items_center().flex_none().bg(t.chrome)
+        .child(div().font_semibold().text_size(14).child("Changes"))
+        .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(task.ref ?? ""))
+        .child(this.button("empty-refresh", this.busy ? "Checking…" : "↻ Refresh", cx => this.refresh(cx, true))))
+      .child(v_flex().flex_1().min_h(0).p(20).gap(10).justify_center()
+        .child(div().text_size(12).text_color(t.muted).child(line))
+        .when(Boolean(this.editor.value().trim()), el => el.child(div().text_size(12).text_color(t.muted).child("Your unsaved draft is kept."))));
   }
 
   errorCard(t) {
@@ -737,13 +767,15 @@ export default class Annotator extends View {
       this.reviewSend = null; this.reviewOptionsOpen = false; this.fileActionsOpen = false; this.aiReview.dismiss();
       const draft = this.draft.enter(next, this.context, { open: this.open, mode: this.mode, base: this.base, baseExplicit: this.baseExplicit, contextLines: this.contextLines }, this.data?.snapshot.revision);
       this.context = next; this.data = null; this.open = draft?.open ?? props()?.file ?? null;
-      const preferences = this.fullSettings(), scope = location().scope;
+      const preferences = this.fullSettings(), { scope, task } = location();
       const savedBase = (shared("annotator.baseRefs") ?? {})[JSON.stringify([scope.machine ?? null, scope.repo])];
       const propBase = props()?.scope?.comparison?.base;
       const propChoice = props()?.base_explicit === undefined ? propBase : { base: propBase, explicit: props().base_explicit };
-      const choice = this.full ? savedBaseChoice(props()?.base_explicit === true ? propChoice : savedBase ?? propChoice)
+      // An open task starts against its own base; its later choices come back from the draft like a space's.
+      const choice = task ? { base: task.base, explicit: Boolean(task.base) }
+        : this.full ? savedBaseChoice(props()?.base_explicit === true ? propChoice : savedBase ?? propChoice)
         : { base: propBase ?? null, explicit: props()?.base_explicit ?? Boolean(propBase) };
-      this.mode = draft?.mode ?? (this.full ? preferences.mode : props()?.scope?.comparison?.mode ?? "uncommitted");
+      this.mode = draft?.mode ?? props()?.initial_mode ?? (task ? "branch" : this.full ? preferences.mode : props()?.scope?.comparison?.mode ?? "uncommitted");
       this.base = draft?.base ?? choice.base; this.baseExplicit = draft?.baseExplicit ?? choice.explicit;
       this.contextLines = draft?.contextLines ?? (this.full ? 3 : props()?.context_lines ?? 3); this.bases = [];
       this.exportText = null; this.error = null; this.snapshotError = null; this.showErrorDetails = false; this.notice = null; this.activeComment = this.editDraft?.id ?? null; this.activeCommentIds = null; this.composerOpen = false;
@@ -763,6 +795,7 @@ export default class Annotator extends View {
     const token = {}; this.snapshotRequest = token;
     const request = { op: "snapshot", scope: { ...current.scope, comparison: { mode: this.mode, base: this.baseExplicit ? this.base : null } }, view: { file: this.open, context: this.contextLines, large_diff: this.largeDiffs?.has(this.navigationKey()) ?? false } };
     this.busy = true;
+    let retry = false;
     cx.spawn(async cx => {
       try {
         if (this.snapshotRequest !== token) return;
@@ -793,9 +826,18 @@ export default class Annotator extends View {
           this.sourceDraftNoticeShown = true;
         }
         if (this.githubContext !== context) this.refreshGithub(cx);
-      } catch (e) { if (this.snapshotRequest === token && contextKey() === context) this.snapshotFailed(e, current.scope); }
+      } catch (e) {
+        if (this.snapshotRequest !== token || contextKey() !== context) return;
+        const task = current.task;
+        if (task && taskGone(e)) { this.data = null; this.error = null; this.snapshotError = { kind: "not-repository" }; return; }
+        // A task's base is a branch name; a worktree may only have origin's copy of it.
+        if (task?.base && this.base === task.base && this.mode === "branch" && !task.base.startsWith("origin/")
+            && /not available locally/.test(String(e))) { this.base = `origin/${task.base}`; retry = true; return; }
+        this.snapshotFailed(e, current.scope);
+      }
       finally {
         if (this.snapshotRequest === token) { this.snapshotRequest = null; this.busy = false; }
+        if (retry) this.refresh(cx, false, true);
         cx.notify();
       }
     });
@@ -846,7 +888,8 @@ export default class Annotator extends View {
           this.notice = `Feedback submitted to the open session (${details.target}). Sent comments are saved under Show sent/resolved.`;
           if (data.github) this.github = data.github;
           for (const thread of details.threads ?? []) this.threadQueue.delete(thread.id);
-          if (agents().some(agent => agent.address === details.target)) run("pane.focus", { terminal: details.target });
+          const recipient = agents().find(agent => agent.address === details.target);
+          if (recipient) run("pane.focus", { pane: recipient.pane });
         }
       } catch (e) {
         if (op === "send" && details.note) noteToken.uncertain = true;
@@ -861,6 +904,8 @@ export default class Annotator extends View {
     const current = location();
     const pinned = props()?.source_target;
     if (pinned) return sessionTarget(agents().filter(a => a.address === pinned), current, null, pinned);
+    // A followed task's feedback goes to its own agent, wherever its chat pane is.
+    if (current.task) return current.task.terminal ? agents().find(a => a.address === current.task.terminal) ?? null : null;
     const key = JSON.stringify([current.scope.machine, current.space, current.tab]);
     const target = sessionTarget(agents(), current, focused(), this.sessions.get(key));
     if (target) this.sessions.set(key, target.address);
@@ -1003,6 +1048,9 @@ export default class Annotator extends View {
     const current = location(), snapshot = this.data.snapshot, target = this.currentSession();
     const existing = existingReviewTab({ ...current, scope: snapshot.scope }, spaces(), panes(), shared("annotator.fullTabs") ?? {});
     if (existing) {
+      if (!this.full && this.open) {
+        setShared("annotator.open", reviewFileRequest(existing.tab, snapshot.scope, this.open, this.mode, this.base, this.baseExplicit));
+      }
       if (existing.pane) run("pane.focus", { pane: existing.pane });
       else run("tab.select", { id: existing.tab });
       cx.notify(); return;
@@ -1010,7 +1058,7 @@ export default class Annotator extends View {
     const args = { name: `Review · ${snapshot.branch ?? "changes"}`, space: current.space,
       mod: "annotator", props: { presentation: "full", scope: snapshot.scope,
         space: current.space, tab: current.tab, source_target: target?.address ?? null,
-         file: this.open, base_explicit: this.baseExplicit, context_lines: this.contextLines, view: this.view,
+         file: this.open, initial_mode: this.mode, base_explicit: this.baseExplicit, context_lines: this.contextLines, view: this.view,
          source_draft: this.hasDraft(),
         ...(props()?.helper ? { helper: props().helper } : {}) } };
     const sourcePanel = layoutSidebar(layout());
@@ -1399,8 +1447,8 @@ export default class Annotator extends View {
       .child(v_flex().flex_none().bg(t.chrome).px(10).py(6)
         .child(h_flex().items_center().gap(7)
           .child(div().font_semibold().text_size(14).child("Changes"))
-          .child(this.selectableText("review-branch-name", `${data?.snapshot.scope.machine ? data.snapshot.scope.machine + " · " : ""}${data?.snapshot.branch ?? ""}`).flex_1().min_w(0).truncate().text_size(11).text_color(t.dim))
-          .child(this.button("open-full-review", "↗", cx => this.openFull(cx), Boolean(data)).tooltip("Open full review tab"))
+          .child(this.selectableText("review-branch-name", `${location().task?.ref ? location().task.ref + " · " : ""}${data?.snapshot.scope.machine ? data.snapshot.scope.machine + " · " : ""}${data?.snapshot.branch ?? ""}`).flex_1().min_w(0).truncate().text_size(11).text_color(t.dim))
+          .child(this.button("open-full-review", "Open review", cx => this.openFull(cx), Boolean(data)).tooltip("Open full review tab"))
           .child(this.aiReviewButton())
           .child(this.button("review-updates", "↑", cx => { this.updates.save({ open: !this.updates.state.open }); this.updates.check(cx); cx.notify(); }).tooltip("Annotator updates"))
           .child(this.button("review-refresh", this.busy ? "…" : "↻", cx => { this.refresh(cx, true); this.refreshGithub(cx, true); }).tooltip("Refresh diff and GitHub"))))

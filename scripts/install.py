@@ -24,7 +24,7 @@ receipt = home / ".local/share/herdr-annotator/install.json"
 updater = receipt.parent / "update.py"
 installed = json.loads(receipt.read_text()) if receipt.exists() else {}
 files = ["mod.json", "review.js", "main.js", "full.js", "syntax.js", "draft.js", "github-refresh.js"]
-files.extend(["updates.js", "ai-review.js"])
+files.extend(["updates.js", "ai-review.js", "chat-agents.js", "navigation.js", "follow.js"])
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 if updater.exists() and (not installed.get("updater_digest") or digest(updater) != installed["updater_digest"]):
