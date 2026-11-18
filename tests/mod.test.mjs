@@ -9,6 +9,7 @@ import { DraftLifecycle } from "../mods/annotator/draft.js";
 import { GithubRefresh } from "../mods/annotator/github-refresh.js";
 import { UpdateController } from "../mods/annotator/updates.js";
 import { mergeChatAgents } from "../mods/annotator/chat-agents.js";
+import * as navigation from "../mods/annotator/navigation.js";
 
 function harness() {
   const nodes = [], requests = [], jobs = [];
@@ -60,7 +61,7 @@ function harness() {
   } }, spawn(fn) { jobs.push(Promise.resolve().then(() => fn(cx))); } };
   const storage = new Map();
   const context = {
-    ...review, ...syntax, ...aiReview, DraftLifecycle, GithubRefresh, UpdateController,
+    ...review, ...syntax, ...aiReview, ...navigation, DraftLifecycle, GithubRefresh, UpdateController,
     sessionStorage: { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value) },
     View: class {}, div: node, h_flex: node, v_flex: node, v_resizable: node, h_resizable: node,
     resizable_panel: () => { state.panelCalls = (state.panelCalls ?? 0) + 1; return node(); },

@@ -9,7 +9,7 @@ import { renderFull } from "./full.js";
 import { highlightDiff } from "./syntax.js";
 import { DraftLifecycle } from "./draft.js";
 import { GithubRefresh } from "./github-refresh.js";
-import { reviewLocation } from "./review.js";
+import { navigationLocation, reviewFileRequest, requestForView } from "./navigation.js";
 import { UpdateController } from "./updates.js";
 import { AiReviewLauncher } from "./ai-review.js";
 import { terminals as liveTerminals } from "herdr";
@@ -17,8 +17,7 @@ import { escapeText, copiedDiff, copiedSelection, contextGaps } from "./review.j
 import { reviewOrderKey, orderedReviewFiles, existingReviewTab, deliveryBlocker, reviewTargetReady, reviewedDraft, agentWaiting, reviewTotals } from "./review.js";
 
 function location() {
-  const fixed = props();
-  return fixed?.scope ? reviewLocation(fixed) : reviewLocation(null, focused(), spaces(), panes(), agents());
+  return navigationLocation(props(), focused(), spaces(), panes(), agents(), shared("annotator.fullTabs") ?? {});
 }
 const contextKey = () => JSON.stringify(location());
 const focusOwner = () => { const f = focused(); return JSON.stringify([f?.space, f?.tab, f?.pane]); };
@@ -588,7 +587,9 @@ export default class Annotator extends View {
 
   consumeOpenRequest(cx) {
     const request = shared("annotator.open");
-    if (!request) return;
+    const reviewTab = request?.target_tab && this.full
+      ? existingReviewTab(location(), spaces(), panes(), shared("annotator.fullTabs") ?? {})?.tab : null;
+    if (!request || !requestForView(request, this.full, reviewTab)) return;
     const clear = () => { if (shared("annotator.open")?.id === request.id) setShared("annotator.open", null); };
     if (typeof request.id !== "string" || !request.id || !Number.isFinite(request.at)
       || Date.now() - request.at > 30000 || request.at > Date.now() + 5000 || typeof request.path !== "string"
@@ -596,6 +597,14 @@ export default class Annotator extends View {
     if (this.busy || this.snapshotError || !this.data) return;
     const scope = this.data.snapshot.scope, root = scope.repo.replace(/\/$/, "");
     if ((request.on ?? null) !== (scope.machine ?? null) || !request.path.startsWith(`${root}/`)) return;
+    if (request.comparison && this.openComparisonId !== request.id) {
+      this.openComparisonId = request.id;
+      const { mode, base, explicit } = request.comparison;
+      if (["uncommitted", "branch", "last_commit"].includes(mode)
+          && (this.mode !== mode || this.base !== base || this.baseExplicit !== explicit)) {
+        this.changeComparison(mode, base, cx, explicit); return;
+      }
+    }
     if (this.openRequestId !== request.id) { this.openRequestId = request.id; this.refresh(cx, true, true); return; }
     const path = request.path.slice(root.length + 1), file = this.data.snapshot.files.find(f => f.path === path);
     if (!file) { this.notice = "Requested file has no diff in this scope."; clear(); return; }
@@ -746,7 +755,7 @@ export default class Annotator extends View {
       const propChoice = props()?.base_explicit === undefined ? propBase : { base: propBase, explicit: props().base_explicit };
       const choice = this.full ? savedBaseChoice(props()?.base_explicit === true ? propChoice : savedBase ?? propChoice)
         : { base: propBase ?? null, explicit: props()?.base_explicit ?? Boolean(propBase) };
-      this.mode = draft?.mode ?? (this.full ? preferences.mode : props()?.scope?.comparison?.mode ?? "uncommitted");
+      this.mode = draft?.mode ?? props()?.initial_mode ?? (this.full ? preferences.mode : props()?.scope?.comparison?.mode ?? "uncommitted");
       this.base = draft?.base ?? choice.base; this.baseExplicit = draft?.baseExplicit ?? choice.explicit;
       this.contextLines = draft?.contextLines ?? (this.full ? 3 : props()?.context_lines ?? 3); this.bases = [];
       this.exportText = null; this.error = null; this.snapshotError = null; this.showErrorDetails = false; this.notice = null; this.activeComment = this.editDraft?.id ?? null; this.activeCommentIds = null; this.composerOpen = false;
@@ -1007,6 +1016,9 @@ export default class Annotator extends View {
     const current = location(), snapshot = this.data.snapshot, target = this.currentSession();
     const existing = existingReviewTab({ ...current, scope: snapshot.scope }, spaces(), panes(), shared("annotator.fullTabs") ?? {});
     if (existing) {
+      if (!this.full && this.open) {
+        setShared("annotator.open", reviewFileRequest(existing.tab, snapshot.scope, this.open, this.mode, this.base, this.baseExplicit));
+      }
       if (existing.pane) run("pane.focus", { pane: existing.pane });
       else run("tab.select", { id: existing.tab });
       cx.notify(); return;
@@ -1014,7 +1026,7 @@ export default class Annotator extends View {
     const args = { name: `Review · ${snapshot.branch ?? "changes"}`, space: current.space,
       mod: "annotator", props: { presentation: "full", scope: snapshot.scope,
         space: current.space, tab: current.tab, source_target: target?.address ?? null,
-         file: this.open, base_explicit: this.baseExplicit, context_lines: this.contextLines, view: this.view,
+         file: this.open, initial_mode: this.mode, base_explicit: this.baseExplicit, context_lines: this.contextLines, view: this.view,
          source_draft: this.hasDraft(),
         ...(props()?.helper ? { helper: props().helper } : {}) } };
     const sourcePanel = layoutSidebar(layout());
@@ -1404,7 +1416,7 @@ export default class Annotator extends View {
         .child(h_flex().items_center().gap(7)
           .child(div().font_semibold().text_size(14).child("Changes"))
           .child(this.selectableText("review-branch-name", `${data?.snapshot.scope.machine ? data.snapshot.scope.machine + " · " : ""}${data?.snapshot.branch ?? ""}`).flex_1().min_w(0).truncate().text_size(11).text_color(t.dim))
-          .child(this.button("open-full-review", "↗", cx => this.openFull(cx), Boolean(data)).tooltip("Open full review tab"))
+          .child(this.button("open-full-review", "Open review", cx => this.openFull(cx), Boolean(data)).tooltip("Open full review tab"))
           .child(this.aiReviewButton())
           .child(this.button("review-updates", "↑", cx => { this.updates.save({ open: !this.updates.state.open }); this.updates.check(cx); cx.notify(); }).tooltip("Annotator updates"))
           .child(this.button("review-refresh", this.busy ? "…" : "↻", cx => { this.refresh(cx, true); this.refreshGithub(cx, true); }).tooltip("Refresh diff and GitHub"))))
