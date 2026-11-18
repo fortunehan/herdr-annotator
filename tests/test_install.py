@@ -20,7 +20,7 @@ class InstallerTest(unittest.TestCase):
             shutil.copy2(source / "scripts" / name, self.repo / "scripts" / name)
         mod = self.repo / "mods/annotator"
         mod.mkdir(parents=True)
-        for name in ["main.js", "review.js", "full.js", "syntax.js", "draft.js", "github-refresh.js", "updates.js", "ai-review.js", "chat-agents.js", "navigation.js", "launcher.js"]:
+        for name in ["main.js", "review.js", "full.js", "syntax.js", "draft.js", "github-refresh.js", "updates.js", "ai-review.js", "chat-agents.js", "navigation.js", "follow.js", "launcher.js"]:
             (mod / name).write_text(f"// {name}\n")
         (mod / "mod.json").write_text(json.dumps({"version": "0.2.0"}))
         (self.repo / ".gitignore").write_text("target/\n__pycache__/\n")

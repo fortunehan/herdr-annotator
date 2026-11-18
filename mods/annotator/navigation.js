@@ -1,13 +1,24 @@
 import { reviewLocation } from "./review.js";
 
-/** Keep Changes on the source checkout when its native chat or review tab has focus. */
-export function navigationLocation(fixed, focus, spaceList, paneList, agentList, reviews) {
+/**
+ * Keep Changes on the source checkout when its native chat or review tab has focus, and on the task
+ * open in Shepherdr's Tasks panel (see follow.js) while there is one. task: followTask()'s result or null.
+ */
+export function navigationLocation(fixed, focus, spaceList, paneList, agentList, reviews, task = null) {
   if (fixed?.scope) return reviewLocation(fixed);
   const review = reviews[focus?.tab];
   if (review && focus && review.space === focus.space && review.scope
       && paneList.some(pane => pane.tab === focus.tab && pane.mod === "annotator")) {
     return { scope: { repo: review.scope.repo, machine: review.scope.machine ?? null }, space: review.space, tab: review.sourceTab };
   }
+  const space = spaceLocation(focus, spaceList, paneList, agentList);
+  if (!task) return space;
+  const { ref, terminal, base, branch, repo, pending } = task;
+  return { scope: { repo: task.cwd ?? "", machine: task.on ?? null }, space: space.space, tab: space.tab,
+    task: { ref, terminal, base, branch, repo, pending } };
+}
+
+function spaceLocation(focus, spaceList, paneList, agentList) {
   const space = spaceList.find(space => space.id === focus?.space) ?? spaceList.find(space => space.active);
   const tab = focus?.tab ?? space?.tabs.find(tab => tab.active)?.id;
   const candidates = agentList.filter(agent => agent.space === space?.id && agent.tab === tab);
