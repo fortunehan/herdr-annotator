@@ -8,6 +8,7 @@ import * as aiReview from "../mods/annotator/ai-review.js";
 import { DraftLifecycle } from "../mods/annotator/draft.js";
 import { GithubRefresh } from "../mods/annotator/github-refresh.js";
 import { UpdateController } from "../mods/annotator/updates.js";
+import { mergeChatAgents } from "../mods/annotator/chat-agents.js";
 
 function harness() {
   const nodes = [], requests = [], jobs = [];
@@ -90,8 +91,9 @@ function harness() {
     TextView: { html: (id, html) => { state.textViews ??= []; state.textViews.push({ id, html }); return node().id(id); } },
     props: () => ({ scope: state.scope, space: "space1", tab: state.tab, ...state.props }),
     theme: () => ({ dim: "#666666", ansi1: "#ff0000", ansi2: "#00ff00" }), settings: () => ({}),
-    agents: () => state.agents, focused: () => state.focus,
+    nativeAgents: () => state.agents, focused: () => state.focus, mergeChatAgents,
     liveTerminals: () => state.terminals ?? state.agents.map((agent, index) => ({ address: agent.address, foreground: { pid: 4000 + index } })),
+    terminals: () => state.terminals ?? state.agents.map((agent, index) => ({ address: agent.address, foreground: { pid: 4000 + index } })),
     spaces: () => [{ id: "space1", tabs: [{ id: state.tab }, ...(state.reviewTabs ?? [])] }],
     panes: () => state.reviewPanes ?? [],
     home: () => "/home/me", exec: async (_helper, args) => {
@@ -1565,7 +1567,7 @@ test("confirmed Send focuses only the exact recipient; failed Send never changes
   const h = harness(); h.mod.init({}, h.cx); await h.drain();
   h.mod.sendToSession(h.cx); await h.drain();
   assert.equal(h.state.commands.at(-1)?.name, "pane.focus");
-  assert.equal(h.state.commands.at(-1)?.args.terminal, "t7");
+  assert.equal(h.state.commands.at(-1)?.args.pane, "p7");
   h.state.commands = [];
   h.state.reply = async () => ({ code: 1, stdout: JSON.stringify({ ok: false, error: "Delivery not confirmed" }) });
   h.mod.sendToSession(h.cx); await h.drain();

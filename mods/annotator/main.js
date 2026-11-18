@@ -1,6 +1,9 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, v_resizable, resizable_panel, v_virtual_list, Scrollbar, TextareaState, Textarea, TextView, InputState, Input, Select, Popup } from "gpui-base";
-import { spaces, panes, focused, agents, exec, home, props, theme, settings, shared, setShared, run, layout, appHome, watchFolder, machines, nextCommand } from "herdr";
+import { spaces, panes, focused, agents as nativeAgents, terminals, exec, home, props, theme, settings, shared, setShared, run, layout, appHome, watchFolder, machines, nextCommand } from "herdr";
+import { mergeChatAgents } from "./chat-agents.js";
+
+const agents = () => mergeChatAgents(nativeAgents(), terminals(), panes(), spaces());
 import { selectionFor, selectionPayload, selected, inlineAt, pendingComments, sessionTarget, fileStats, pathParts, commentStatus, commentLocation, reviewSummary, sendHint, unreadItems, visibleComments, layoutSidebar, reviewSidebarTransition, fullPreferences, snapshotFailure, needsFreshSnapshot, savedBaseChoice } from "./review.js";
 import { renderFull } from "./full.js";
 import { highlightDiff } from "./syntax.js";
@@ -846,7 +849,8 @@ export default class Annotator extends View {
           this.notice = `Feedback submitted to the open session (${details.target}). Sent comments are saved under Show sent/resolved.`;
           if (data.github) this.github = data.github;
           for (const thread of details.threads ?? []) this.threadQueue.delete(thread.id);
-          if (agents().some(agent => agent.address === details.target)) run("pane.focus", { terminal: details.target });
+          const recipient = agents().find(agent => agent.address === details.target);
+          if (recipient) run("pane.focus", { pane: recipient.pane });
         }
       } catch (e) {
         if (op === "send" && details.note) noteToken.uncertain = true;
